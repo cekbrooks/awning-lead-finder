@@ -1,3 +1,6 @@
+import os
+if "GOOGLE_PLACES_API_KEY" in st.secrets:
+    os.environ["GOOGLE_PLACES_API_KEY"] = st.secrets["GOOGLE_PLACES_API_KEY"]
 import streamlit as st
 import pandas as pd
 from io import BytesIO
@@ -84,3 +87,4 @@ if st.button("🔍 Find Leads", type="primary"):
         file_name=f"{street_clean.replace(' ', '_')}_{borough}_AWNING_LEADS.csv",
         mime="text/csv",
     )
+Inject Streamlit secret into env for find_awning_leads
