@@ -1,347 +1,406 @@
 #!/usr/bin/env python3
 """
 NYC Awning Lead Finder
-======================
+----------------------
+Pulls DOB awning permits for a given street, geocodes addresses, then enriches
+with OSM POIs and (optionally) Google Places to identify the current occupant
+storefront. The DOB awning permit is the primary lead signal; everything else
+is just to figure out who is at that address today.
 
-Given any NYC street name, this script produces a CSV of addresses with
-filed awning permits, the building owners, and (where findable) the
-current businesses at those addresses.
-
-USAGE:
-    python find_awning_leads.py "BLEECKER STREET" --borough MANHATTAN
-    python find_awning_leads.py "MULBERRY STREET" --borough MANHATTAN
-    python find_awning_leads.py "BEDFORD AVE" --borough BROOKLYN
-    python find_awning_leads.py "STEINWAY STREET" --borough QUEENS
-
-OPTIONS:
-    --borough  MANHATTAN | BROOKLYN | QUEENS | BRONX | STATEN ISLAND
-    --output   Path for the output .xlsx and .csv (default: ./<street>_leads)
-    --skip-osm Skip the OpenStreetMap Overpass enrichment step (faster)
-
-DATA SOURCES (all free, no API keys required):
-    1. NYC DOB Job Applications (filtered for "AWNING" in description)
-    2. NYC DCWP Sidewalk Cafe Licenses
-    3. OpenStreetMap Nominatim (geocoding)
-    4. OpenStreetMap Overpass API (business POI lookup)
-
-OPTIONAL:
-    Set GOOGLE_PLACES_API_KEY environment variable to enable Google Places
-    enrichment (catches well-known chain businesses OSM misses). Without
-    a key, the script will skip Google and rely on OSM only — still
-    typically gets 50-60% coverage.
-
-REQUIREMENTS:
-    pip install requests pandas openpyxl
+Filtering philosophy:
+  - We only care about street-level retail / F&B / consumer-services storefronts
+    that plausibly have an awning.
+  - Google place types are noisy (one place can have ['point_of_interest',
+    'establishment', 'lawyer'] etc.), so we use an allowlist + denylist with a
+    confidence label rather than a hard yes/no.
 """
 
 import argparse
-import json
 import os
+import re
 import sys
 import time
-from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
 
-# -------------------- CONFIG --------------------
-NYC_OPEN_DATA_BASE = "https://data.cityofnewyork.us/resource"
-DOB_JOBS_DATASET = "ic3t-wcy2"          # Job Application Filings (legacy BIS)
-SIDEWALK_CAFE_DATASET = "qcdj-rwhu"     # Sidewalk Cafe Licenses
-LEGAL_BIZ_DATASET = "w7w3-xahh"         # Legally Operating Businesses
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
-NOMINATIM_BASE = "https://nominatim.openstreetmap.org/search"
-OVERPASS_ENDPOINTS = [
-    "https://overpass.private.coffee/api/interpreter",
-    "https://overpass.kumi.systems/api/interpreter",
-    "https://overpass-api.de/api/interpreter",
-]
+NYC_DOB_PERMITS_ENDPOINT = "https://data.cityofnewyork.us/resource/ipu4-2q9a.json"
+NOMINATIM_ENDPOINT = "https://nominatim.openstreetmap.org/search"
+GOOGLE_GEOCODE_ENDPOINT = "https://maps.googleapis.com/maps/api/geocode/json"
+GOOGLE_PLACES_NEARBY_ENDPOINT = (
+    "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
+)
+GOOGLE_PLACE_DETAILS_ENDPOINT = (
+    "https://maps.googleapis.com/maps/api/place/details/json"
+)
+OVERPASS_ENDPOINT = "https://overpass-api.de/api/interpreter"
 
-USER_AGENT = "AwningLeadResearch/1.0"
-GOOGLE_KEY = os.environ.get("GOOGLE_PLACES_API_KEY")
+USER_AGENT = "awning-lead-finder/0.2 (https://github.com/cekbrooks/awning-lead-finder)"
+
+# Google Places types we treat as a likely street-level storefront with an awning.
+STOREFRONT_TYPES = {
+    # Food & beverage
+    "restaurant", "cafe", "bakery", "bar", "meal_takeaway", "meal_delivery",
+    "ice_cream_shop",
+    # Retail
+    "clothing_store", "shoe_store", "jewelry_store", "book_store", "florist",
+    "furniture_store", "home_goods_store", "hardware_store", "bicycle_store",
+    "pet_store", "liquor_store", "convenience_store", "grocery_or_supermarket",
+    "supermarket", "store",
+    # Personal services with storefronts
+    "hair_care", "beauty_salon", "spa", "nail_salon", "barber_shop",
+    "laundry", "dry_cleaning", "tailor",
+    # Health-adjacent retail (per user: opticians/optometrists IN)
+    "optician", "optometrist", "pharmacy", "drugstore",
+}
+
+# Possibly a storefront — keep but flag as "Maybe". Per user: doctors stay in.
+MAYBE_STOREFRONT_TYPES = {
+    "doctor", "dentist", "physiotherapist", "veterinary_care",
+    "bank", "atm",
+    "travel_agency", "real_estate_agency", "insurance_agency",
+    "art_gallery", "movie_theater", "gym",
+}
+
+# If the place is ONLY these types (no storefront/maybe types), drop it.
+EXCLUDE_TYPES = {
+    "lawyer", "accounting", "school", "primary_school", "secondary_school",
+    "university", "church", "place_of_worship", "mosque", "synagogue",
+    "hindu_temple", "lodging", "premise", "subpremise", "route", "locality",
+    "political", "neighborhood", "park", "parking", "transit_station",
+    "bus_station", "subway_station", "train_station", "embassy", "city_hall",
+    "courthouse", "post_office", "fire_station", "police", "cemetery",
+    "funeral_home", "storage", "moving_company",
+}
 
 
-# -------------------- STEP 1: PERMITS --------------------
-def fetch_awning_permits(street_name: str, borough: str) -> pd.DataFrame:
-    """Pull DOB job applications mentioning AWNING for a given street."""
-    print(f"\n[1/4] Pulling DOB awning permits for {street_name}, {borough}...")
-    url = f"{NYC_OPEN_DATA_BASE}/{DOB_JOBS_DATASET}.json"
-    params = {
-        "$where": f"borough='{borough}' AND street_name='{street_name.upper()}'",
-        "$select": "job__,house__,street_name,job_type,other,other_description,"
-                   "owner_s_business_name,owner_sphone__,job_status_descrp,latest_action_date",
-        "$limit": 50000,
-    }
-    r = requests.get(url, params=params, timeout=180)
+def classify_place(types: List[str]) -> Optional[str]:
+    """Return a confidence label or None to drop the place entirely.
+
+    Priority:
+      1. If any type is in STOREFRONT_TYPES -> 'Likely storefront'
+      2. Else if any type is in MAYBE_STOREFRONT_TYPES -> 'Maybe storefront'
+      3. Else if every type is in EXCLUDE_TYPES (or generic) -> drop (None)
+      4. Otherwise -> 'Unknown' (keep, low confidence)
+    """
+    if not types:
+        return "Unknown"
+    tset = set(types)
+    if tset & STOREFRONT_TYPES:
+        return "Likely storefront"
+    if tset & MAYBE_STOREFRONT_TYPES:
+        return "Maybe storefront"
+    # Strip out generic noise tags before deciding to exclude
+    generic = {"point_of_interest", "establishment", "food", "health", "finance"}
+    meaningful = tset - generic
+    if meaningful and meaningful.issubset(EXCLUDE_TYPES):
+        return None
+    return "Unknown"
+
+
+# ---------------------------------------------------------------------------
+# DOB permits
+# ---------------------------------------------------------------------------
+
+def fetch_awning_permits(street: str, borough: str, since_year: int = 2015) -> pd.DataFrame:
+    """Pull DOB job filings tagged as awning work for the given street."""
+    where = (
+        f"upper(street_name) = upper('{street}') "
+        f"AND upper(borough) = upper('{borough}') "
+        f"AND (upper(job_description) like '%AWNING%' "
+        f"OR upper(job_description) like '%CANOPY%') "
+        f"AND filing_date >= '{since_year}-01-01T00:00:00.000'"
+    )
+    params = {"$where": where, "$limit": 5000, "$order": "filing_date DESC"}
+    r = requests.get(NYC_DOB_PERMITS_ENDPOINT, params=params, timeout=30)
     r.raise_for_status()
-    df = pd.DataFrame(r.json())
-    if df.empty:
-        return df
-
-    # Filter for awning mentions
-    if "other_description" in df.columns:
-        mask = df["other_description"].fillna("").str.upper().str.contains("AWNING")
-        df = df[mask].copy()
-
-    if df.empty:
-        print(f"   No awning permits found.")
-        return df
-
-    df["latest_action_date"] = pd.to_datetime(df["latest_action_date"], errors="coerce")
-    # Dedupe to most recent permit per address
-    df = df.sort_values("latest_action_date", ascending=False)
-    df = df.drop_duplicates(subset="house__", keep="first")
-    df["house_num"] = pd.to_numeric(df["house__"], errors="coerce").astype("Int64")
-    df = df.dropna(subset=["house_num"]).sort_values("house_num")
-    print(f"   Found {len(df)} unique addresses with awning permits.")
+    rows = r.json()
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    keep = [
+        "job__", "house__", "street_name", "borough", "job_description",
+        "filing_date", "owner_s_business_name", "owner_s_first_name",
+        "owner_s_last_name", "owner_s_phone__",
+    ]
+    keep = [c for c in keep if c in df.columns]
+    df = df[keep].copy()
+    df = df.rename(columns={
+        "job__": "job_number",
+        "house__": "house_num",
+        "owner_s_business_name": "permit_owner_business",
+        "owner_s_first_name": "permit_owner_first",
+        "owner_s_last_name": "permit_owner_last",
+        "owner_s_phone__": "permit_owner_phone",
+    })
     return df
 
 
-def fetch_sidewalk_cafes(street_name: str) -> set:
-    """Get addresses with active sidewalk cafe licenses (high awning probability)."""
-    url = f"{NYC_OPEN_DATA_BASE}/{SIDEWALK_CAFE_DATASET}.json"
-    params = {
-        "$where": f"upper(street) like '%{street_name.upper()}%'",
-        "$limit": 5000,
-    }
-    try:
-        r = requests.get(url, params=params, timeout=60)
-        if r.status_code == 200 and r.json():
-            df = pd.DataFrame(r.json())
-            return set(int(b) for b in pd.to_numeric(df["building"], errors="coerce").dropna())
-    except Exception:
-        pass
-    return set()
+# ---------------------------------------------------------------------------
+# Geocoding
+# ---------------------------------------------------------------------------
 
+def geocode_addresses(
+    addresses: List[Tuple[str, str, str]],
+) -> Dict[str, Tuple[float, float]]:
+    """Geocode (house_num, street, borough) tuples -> {address_key: (lat, lng)}.
 
-# -------------------- STEP 2: GEOCODE --------------------
-def geocode_addresses(addresses, borough: str) -> dict:
-    """Geocode (number, street) via Google if GOOGLE_KEY is set, else Nominatim."""
-    results = {}
+    Uses Google Geocoding API if GOOGLE_PLACES_API_KEY is set (Streamlit IPs are
+    blocked by Nominatim). Falls back to Nominatim otherwise.
+    """
+    api_key = os.environ.get("GOOGLE_PLACES_API_KEY")
+    out: Dict[str, Tuple[float, float]] = {}
 
-    if GOOGLE_KEY:
-        print(f"\n[2/4] Geocoding {len(addresses)} addresses via Google Geocoding API...")
-        for num, street in addresses:
-            addr = f"{num} {street}, {borough}, NY"
+    for house_num, street, borough in addresses:
+        key = f"{house_num} {street}, {borough}, NY"
+        if api_key:
             try:
                 r = requests.get(
-                    "https://maps.googleapis.com/maps/api/geocode/json",
-                    params={"address": addr, "key": GOOGLE_KEY},
-                    timeout=15,
+                    GOOGLE_GEOCODE_ENDPOINT,
+                    params={"address": key, "key": api_key},
+                    timeout=20,
                 )
-                if r.status_code == 200:
-                    data = r.json()
-                    if data.get("status") == "OK" and data.get("results"):
-                        loc = data["results"][0]["geometry"]["location"]
-                        results[num] = (loc["lat"], loc["lng"])
-                    elif data.get("status") not in ("OK", "ZERO_RESULTS"):
-                        print(f"   Google geocode error for {addr}: {data.get('status')} {data.get('error_message','')}")
-                else:
-                    print(f"   Google geocode HTTP {r.status_code} for {addr}")
-            except Exception as e:
-                print(f"   Google geocode exception for {addr}: {e}")
-        print(f"   Geocoded {len(results)}/{len(addresses)} via Google.")
-        return results
-
-    # Fallback: Nominatim
-    print(f"\n[2/4] Geocoding {len(addresses)} addresses via OpenStreetMap (no Google key)...")
-    headers = {"User-Agent": USER_AGENT}
-    for num, street in addresses:
-        addr = f"{num} {street} {borough} NY"
+                data = r.json()
+                if data.get("status") == "OK" and data.get("results"):
+                    loc = data["results"][0]["geometry"]["location"]
+                    out[key] = (loc["lat"], loc["lng"])
+                    continue
+            except Exception:
+                pass
+        # Fallback: Nominatim
         try:
-            r = requests.get(NOMINATIM_BASE, headers=headers,
-                             params={"q": addr, "format": "json", "limit": 1}, timeout=15)
-            if r.status_code == 200 and r.json():
-                d = r.json()[0]
-                results[num] = (float(d["lat"]), float(d["lon"]))
-        except Exception as e:
-            print(f"   Nominatim error for {addr}: {e}")
-        time.sleep(1.1)
-    print(f"   Geocoded {len(results)}/{len(addresses)} via Nominatim.")
-    return results
-
-
-# -------------------- STEP 3: OSM POI LOOKUP --------------------
-def overpass_query(lat: float, lon: float, radius: int = 25) -> list:
-    """Query Overpass API for businesses near a point. Tries mirrors."""
-    query = f"""[out:json][timeout:20];
-(nwr["shop"](around:{radius},{lat},{lon});
- nwr["amenity"~"^(restaurant|cafe|bar|pub|fast_food|ice_cream|bank|pharmacy|cinema|theatre|nightclub)$"](around:{radius},{lat},{lon});
- nwr["office"](around:{radius},{lat},{lon});
- nwr["craft"](around:{radius},{lat},{lon});
- nwr["tourism"~"^(hotel|gallery|museum)$"](around:{radius},{lat},{lon}););
-out tags center;"""
-    headers = {"User-Agent": USER_AGENT}
-    for ep in OVERPASS_ENDPOINTS:
-        try:
-            r = requests.post(ep, data={"data": query}, headers=headers, timeout=40)
-            if r.status_code == 200:
-                return r.json().get("elements", [])
-        except Exception:
-            continue
-    return []
-
-
-def fetch_osm_pois(geocoded: dict) -> dict:
-    """For each geocoded address, fetch nearby POIs from OSM."""
-    print(f"\n[3/4] Looking up OpenStreetMap POIs near each address...")
-    results = {}
-
-    def fetch_one(num, lat, lon):
-        elements = overpass_query(lat, lon)
-        hits = []
-        for el in elements:
-            tags = el.get("tags", {})
-            name = tags.get("name") or tags.get("brand") or tags.get("operator")
-            if not name:
-                continue
-            hits.append({
-                "name": name,
-                "kind": (tags.get("shop") or tags.get("amenity") or tags.get("office")
-                         or tags.get("craft") or tags.get("tourism")),
-                "phone": tags.get("phone") or tags.get("contact:phone"),
-                "website": tags.get("website") or tags.get("contact:website"),
-                "addr_num": tags.get("addr:housenumber", ""),
-            })
-        return num, hits
-
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        futs = [ex.submit(fetch_one, num, lat, lon) for num, (lat, lon) in geocoded.items()]
-        for fu in as_completed(futs):
-            num, hits = fu.result()
-            results[num] = hits
-    matched = sum(1 for v in results.values() if v)
-    print(f"   Got POI data for {matched}/{len(geocoded)} addresses.")
-    return results
-
-
-# -------------------- STEP 4: GOOGLE PLACES (optional) --------------------
-def fetch_google_places(geocoded: dict) -> dict:
-    """If GOOGLE_PLACES_API_KEY is set, query Nearby Search at each lat/long."""
-    if not GOOGLE_KEY:
-        print(f"\n[4/4] Skipping Google Places (no GOOGLE_PLACES_API_KEY env var set).")
-        return {}
-
-    print(f"\n[4/4] Querying Google Places for {len(geocoded)} addresses...")
-    results = {}
-    for num, (lat, lon) in geocoded.items():
-        url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
-        params = {"location": f"{lat},{lon}", "radius": 25, "key": GOOGLE_KEY}
-        try:
-            r = requests.get(url, params=params, timeout=30)
-            if r.status_code == 200:
-                hits = []
-                for p in r.json().get("results", []):
-                    types = p.get("types", [])
-                    # Skip pure address/premise results
-                    if "establishment" in types and not (set(types) & {"premise", "subpremise", "street_address"}):
-                        details = {"name": p.get("name"), "place_id": p.get("place_id"),
-                                   "types": types, "rating": p.get("rating"),
-                                   "vicinity": p.get("vicinity")}
-                        # Get phone via Place Details
-                        det_url = "https://maps.googleapis.com/maps/api/place/details/json"
-                        det_params = {"place_id": p["place_id"],
-                                      "fields": "formatted_phone_number,formatted_address",
-                                      "key": GOOGLE_KEY}
-                        d = requests.get(det_url, params=det_params, timeout=15)
-                        if d.status_code == 200:
-                            details.update(d.json().get("result", {}))
-                        hits.append(details)
-                results[num] = hits
+            r = requests.get(
+                NOMINATIM_ENDPOINT,
+                params={"q": key, "format": "json", "limit": 1},
+                headers={"User-Agent": USER_AGENT},
+                timeout=20,
+            )
+            arr = r.json()
+            if arr:
+                out[key] = (float(arr[0]["lat"]), float(arr[0]["lon"]))
+            time.sleep(1.0)  # Nominatim politeness
         except Exception:
             pass
+    return out
+
+
+# ---------------------------------------------------------------------------
+# OSM (Overpass)
+# ---------------------------------------------------------------------------
+
+def fetch_osm_pois(geocoded: Dict[str, Tuple[float, float]]) -> Dict[str, List[dict]]:
+    """For each geocoded address, find nearby OSM POIs (shops/amenities)."""
+    out: Dict[str, List[dict]] = {}
+    for addr, (lat, lng) in geocoded.items():
+        q = f"""
+        [out:json][timeout:25];
+        (
+          node(around:30,{lat},{lng})[shop];
+          node(around:30,{lat},{lng})[amenity~"^(restaurant|cafe|bar|pub|fast_food|bakery|pharmacy|optician|hairdresser|beauty|dry_cleaning)$"];
+          way(around:30,{lat},{lng})[shop];
+        );
+        out center tags;
+        """
+        try:
+            r = requests.post(OVERPASS_ENDPOINT, data={"data": q}, timeout=40)
+            r.raise_for_status()
+            elements = r.json().get("elements", [])
+            out[addr] = elements
+        except Exception:
+            out[addr] = []
+        time.sleep(0.5)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Google Places
+# ---------------------------------------------------------------------------
+
+def fetch_google_places(
+    geocoded: Dict[str, Tuple[float, float]],
+) -> Dict[str, List[dict]]:
+    """For each geocoded address, find nearby Google Places, filtered to likely
+    storefronts via classify_place()."""
+    api_key = os.environ.get("GOOGLE_PLACES_API_KEY")
+    if not api_key:
+        return {}
+
+    out: Dict[str, List[dict]] = {}
+    for addr, (lat, lng) in geocoded.items():
+        try:
+            r = requests.get(
+                GOOGLE_PLACES_NEARBY_ENDPOINT,
+                params={
+                    "location": f"{lat},{lng}",
+                    "radius": 30,
+                    "key": api_key,
+                },
+                timeout=20,
+            )
+            results = r.json().get("results", []) or []
+        except Exception:
+            results = []
+
+        kept: List[dict] = []
+        for p in results:
+            label = classify_place(p.get("types", []))
+            if label is None:
+                continue
+            # Get details for phone + website
+            place_id = p.get("place_id")
+            phone, website = "", ""
+            if place_id:
+                try:
+                    d = requests.get(
+                        GOOGLE_PLACE_DETAILS_ENDPOINT,
+                        params={
+                            "place_id": place_id,
+                            "fields": "formatted_phone_number,website,name,formatted_address",
+                            "key": api_key,
+                        },
+                        timeout=20,
+                    ).json()
+                    res = d.get("result", {}) or {}
+                    phone = res.get("formatted_phone_number", "") or ""
+                    website = res.get("website", "") or ""
+                except Exception:
+                    pass
+            kept.append({
+                "name": p.get("name", ""),
+                "types": p.get("types", []),
+                "vicinity": p.get("vicinity", ""),
+                "phone": phone,
+                "website": website,
+                "confidence": label,
+            })
+            time.sleep(0.05)
+
+        # Sort: Likely > Maybe > Unknown
+        order = {"Likely storefront": 0, "Maybe storefront": 1, "Unknown": 2}
+        kept.sort(key=lambda x: order.get(x["confidence"], 9))
+        out[addr] = kept
         time.sleep(0.1)
-    print(f"   Google returned business listings for {sum(1 for v in results.values() if v)}/{len(geocoded)}.")
-    return results
+    return out
 
 
-# -------------------- ASSEMBLE FINAL OUTPUT --------------------
-def build_final_table(permits: pd.DataFrame, geocoded: dict, osm: dict,
-                      google: dict, sidewalk_cafes: set) -> pd.DataFrame:
-    rows = []
-    for _, p in permits.iterrows():
-        num = int(p["house_num"])
-        base = {
-            "Address #": num,
-            "Street": p["street_name"],
-            "Building Owner / LLC": p.get("owner_s_business_name"),
-            "Owner Phone (on file)": p.get("owner_sphone__"),
-            "Most Recent Awning Permit": p["latest_action_date"].strftime("%Y-%m-%d") if pd.notna(p["latest_action_date"]) else "",
-            "Has Sidewalk Cafe": num in sidewalk_cafes,
-            "Latitude": geocoded.get(num, (None, None))[0],
-            "Longitude": geocoded.get(num, (None, None))[1],
-        }
+# ---------------------------------------------------------------------------
+# Assembly
+# ---------------------------------------------------------------------------
 
-        # Google hits (highest priority)
-        for h in google.get(num, []):
-            rows.append({**base, "Business": h["name"], "Phone": h.get("formatted_phone_number"),
-                         "Category": ", ".join(h.get("types", [])[:2]),
-                         "Rating": h.get("rating"), "Source": "Google Places"})
-
-        # OSM exact-address matches
-        exact_hits = []
-        nearby_hits = []
-        for h in osm.get(num, []):
-            try:
-                if h["addr_num"] and int(h["addr_num"]) == num:
-                    exact_hits.append(h)
-                else:
-                    nearby_hits.append(h)
-            except (ValueError, TypeError):
-                nearby_hits.append(h)
-
-        for h in exact_hits:
-            rows.append({**base, "Business": h["name"], "Phone": h.get("phone"),
-                         "Category": h.get("kind"), "Rating": None,
-                         "Source": "OpenStreetMap (exact address)"})
-
-        # Only include OSM nearby hits if we have nothing else for this address
-        if not google.get(num) and not exact_hits:
-            for h in nearby_hits:
-                label = f"{h['name']} [at {h['addr_num']}]" if h.get("addr_num") else f"{h['name']} [nearby]"
-                rows.append({**base, "Business": label, "Phone": h.get("phone"),
-                             "Category": h.get("kind"), "Rating": None,
-                             "Source": "OpenStreetMap (nearby - verify)"})
-
-        # If nothing at all, keep address row with permit info
-        if not google.get(num) and not exact_hits and not nearby_hits:
-            rows.append({**base, "Business": None, "Phone": None,
-                         "Category": None, "Rating": None, "Source": None})
-
-    df = pd.DataFrame(rows)
-    cols = ["Address #", "Street", "Business", "Category", "Phone", "Rating", "Source",
-            "Building Owner / LLC", "Owner Phone (on file)", "Most Recent Awning Permit",
-            "Has Sidewalk Cafe", "Latitude", "Longitude"]
-    return df[cols].sort_values(["Address #", "Source"], kind="stable")
-
-
-# -------------------- MAIN --------------------
-def main():
-    ap = argparse.ArgumentParser(description="Find businesses with awning permits on a NYC street.")
-    ap.add_argument("street", help='Street name, e.g. "BLEECKER STREET"')
-    ap.add_argument("--borough", default="MANHATTAN",
-                    choices=["MANHATTAN", "BROOKLYN", "QUEENS", "BRONX", "STATEN ISLAND"])
-    ap.add_argument("--output", default=None, help="Output file prefix (no extension)")
-    ap.add_argument("--skip-osm", action="store_true", help="Skip OSM Overpass step")
-    args = ap.parse_args()
-
-    street = args.street.upper().strip()
-    borough = args.borough.upper()
-    out_prefix = args.output or f"{street.replace(' ', '_')}_{borough}_AWNING_LEADS"
-
-    # Step 1: permits
-    permits = fetch_awning_permits(street, borough)
+def build_final_table(
+    permits: pd.DataFrame,
+    geocoded: Dict[str, Tuple[float, float]],
+    osm: Dict[str, List[dict]],
+    google: Dict[str, List[dict]],
+    cafes: bool = False,
+) -> pd.DataFrame:
+    rows: List[dict] = []
     if permits.empty:
-        print("\nNo awning permits found. Exiting.")
-        return 1
+        return pd.DataFrame()
 
-    # Sidewalk cafes
-    cafes = fetch_sidewalk_cafes(street)
+    grouped = permits.groupby(["house_num", "street_name", "borough"], dropna=False)
+    for (house_num, street, borough), gdf in grouped:
+        addr_key = f"{house_num} {street}, {borough}, NY"
+        latlng = geocoded.get(addr_key)
+        permit_owner = ""
+        if "permit_owner_business" in gdf.columns:
+            vals = [v for v in gdf["permit_owner_business"].dropna().tolist() if v]
+            if vals:
+                permit_owner = vals[0]
 
-    # Step 2: geocode
-    addresses = [(int(r["house_num"]), street) for _, r in permits.iterrows()]
-    geocoded = geocode_addresses(addresses, borough)
+        google_hits = google.get(addr_key, []) or []
+        osm_hits = osm.get(addr_key, []) or []
+
+        if google_hits:
+            for g in google_hits:
+                rows.append({
+                    "Address #": house_num,
+                    "Street": street,
+                    "Borough": borough,
+                    "Lat": latlng[0] if latlng else None,
+                    "Lng": latlng[1] if latlng else None,
+                    "Permit Owner": permit_owner,
+                    "Business": g.get("name", ""),
+                    "Source": "Google",
+                    "Confidence": g.get("confidence", ""),
+                    "Phone": g.get("phone", ""),
+                    "Website": g.get("website", ""),
+                    "Types": ", ".join(g.get("types", []) or []),
+                })
+        elif osm_hits:
+            for o in osm_hits:
+                tags = o.get("tags", {}) or {}
+                rows.append({
+                    "Address #": house_num,
+                    "Street": street,
+                    "Borough": borough,
+                    "Lat": latlng[0] if latlng else None,
+                    "Lng": latlng[1] if latlng else None,
+                    "Permit Owner": permit_owner,
+                    "Business": tags.get("name", ""),
+                    "Source": "OSM",
+                    "Confidence": "OSM",
+                    "Phone": tags.get("phone", "") or tags.get("contact:phone", ""),
+                    "Website": tags.get("website", "") or tags.get("contact:website", ""),
+                    "Types": tags.get("shop", "") or tags.get("amenity", ""),
+                })
+        else:
+            rows.append({
+                "Address #": house_num,
+                "Street": street,
+                "Borough": borough,
+                "Lat": latlng[0] if latlng else None,
+                "Lng": latlng[1] if latlng else None,
+                "Permit Owner": permit_owner,
+                "Business": None,
+                "Source": "",
+                "Confidence": "",
+                "Phone": "",
+                "Website": "",
+                "Types": "",
+            })
+
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("--street", required=True)
+    p.add_argument("--borough", default="MANHATTAN")
+    p.add_argument("--since-year", type=int, default=2015)
+    p.add_argument("--skip-osm", action="store_true")
+    p.add_argument("--cafes", action="store_true",
+                   help="(legacy flag, kept for compatibility)")
+    p.add_argument("--out-prefix", default="awning_leads")
+    args = p.parse_args()
+
+    street = args.street.strip()
+    borough = args.borough.strip().upper()
+    out_prefix = args.out_prefix
+    cafes = args.cafes
+
+    # Step 1: Permits
+    permits = fetch_awning_permits(street, borough, since_year=args.since_year)
+    if permits.empty:
+        print(f"No awning permits found for {street}, {borough}")
+        return 0
+
+    # Step 2: Geocode unique addresses
+    uniq = (
+        permits[["house_num", "street_name", "borough"]]
+        .drop_duplicates()
+        .itertuples(index=False, name=None)
+    )
+    geocoded = geocode_addresses(list(uniq))
 
     # Step 3: OSM
     osm = {} if args.skip_osm else fetch_osm_pois(geocoded)
@@ -357,10 +416,10 @@ def main():
     found_addrs = final[final["Business"].notna()]["Address #"].nunique()
     print(f"\n{'='*60}")
     print(f"SUMMARY")
-    print(f"  Street:                          {street}, {borough}")
-    print(f"  Awning-permit addresses:         {total_addrs}")
-    print(f"  Addresses w/ business found:     {found_addrs} ({found_addrs/total_addrs*100:.0f}%)")
-    print(f"  Total business leads:            {final['Business'].notna().sum()}")
+    print(f"  Street:                       {street}, {borough}")
+    print(f"  Awning-permit addresses:      {total_addrs}")
+    print(f"  Addresses w/ business found:  {found_addrs} ({found_addrs/total_addrs*100:.0f}%)")
+    print(f"  Total business leads:         {final['Business'].notna().sum()}")
     print(f"{'='*60}")
 
     final.to_csv(f"{out_prefix}.csv", index=False)
