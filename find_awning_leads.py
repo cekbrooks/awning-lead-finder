@@ -62,6 +62,56 @@ USER_AGENT = "AwningLeadResearch/1.0"
 GOOGLE_KEY = os.environ.get("GOOGLE_PLACES_API_KEY")
 
 
+# -------------------- STOREFRONT FILTER --------------------
+# Likely street-level retail / F&B / consumer-services with awnings.
+STOREFRONT_TYPES = {
+    "restaurant", "cafe", "bakery", "bar", "meal_takeaway", "meal_delivery",
+    "ice_cream_shop",
+    "clothing_store", "shoe_store", "jewelry_store", "book_store", "florist",
+    "furniture_store", "home_goods_store", "hardware_store", "bicycle_store",
+    "pet_store", "liquor_store", "convenience_store", "grocery_or_supermarket",
+    "supermarket", "store",
+    "hair_care", "beauty_salon", "spa", "nail_salon", "barber_shop",
+    "laundry", "dry_cleaning", "tailor",
+    "optician", "optometrist", "pharmacy", "drugstore",
+}
+# Possibly a storefront — keep but flag as "Maybe". Doctors/dentists stay in.
+MAYBE_STOREFRONT_TYPES = {
+    "doctor", "dentist", "physiotherapist", "veterinary_care",
+    "bank", "atm",
+    "travel_agency", "real_estate_agency", "insurance_agency",
+    "art_gallery", "movie_theater", "gym",
+}
+# If the place is ONLY these types, drop it.
+EXCLUDE_TYPES = {
+    "lawyer", "accounting", "school", "primary_school", "secondary_school",
+    "university", "church", "place_of_worship", "mosque", "synagogue",
+    "hindu_temple", "lodging", "premise", "subpremise", "route", "locality",
+    "political", "neighborhood", "park", "parking", "transit_station",
+    "bus_station", "subway_station", "train_station", "embassy", "city_hall",
+    "courthouse", "post_office", "fire_station", "police", "cemetery",
+    "funeral_home", "storage", "moving_company",
+}
+
+
+def classify_place(types):
+    """Return 'Likely storefront' / 'Maybe storefront' / 'Unknown', or None to drop."""
+    if not types:
+        return "Unknown"
+    tset = set(types)
+    if tset & STOREFRONT_TYPES:
+        return "Likely storefront"
+    if tset & MAYBE_STOREFRONT_TYPES:
+        return "Maybe storefront"
+    generic = {"point_of_interest", "establishment", "food", "health", "finance"}
+    meaningful = tset - generic
+    if meaningful and meaningful.issubset(EXCLUDE_TYPES):
+        return None
+    if meaningful & EXCLUDE_TYPES:
+        return None
+    return "Unknown"
+
+
 # -------------------- STEP 1: PERMITS --------------------
 def fetch_awning_permits(street_name: str, borough: str) -> pd.DataFrame:
     """Pull DOB job applications mentioning AWNING for a given street."""
@@ -170,7 +220,8 @@ def overpass_query(lat: float, lon: float, radius: int = 25) -> list:
  nwr["amenity"~"^(restaurant|cafe|bar|pub|fast_food|ice_cream|bank|pharmacy|cinema|theatre|nightclub)$"](around:{radius},{lat},{lon});
  nwr["office"](around:{radius},{lat},{lon});
  nwr["craft"](around:{radius},{lat},{lon});
- nwr["tourism"~"^(hotel|gallery|museum)$"](around:{radius},{lat},{lon}););
+ nwr["tourism"~"^(hotel|gallery|museum)$"](around:{radius},{lat},{lon});
+);
 out tags center;"""
     headers = {"User-Agent": USER_AGENT}
     for ep in OVERPASS_ENDPOINTS:
@@ -234,20 +285,26 @@ def fetch_google_places(geocoded: dict) -> dict:
                 hits = []
                 for p in r.json().get("results", []):
                     types = p.get("types", [])
-                    # Skip pure address/premise results
-                    if "establishment" in types and not (set(types) & {"premise", "subpremise", "street_address"}):
-                        details = {"name": p.get("name"), "place_id": p.get("place_id"),
-                                   "types": types, "rating": p.get("rating"),
-                                   "vicinity": p.get("vicinity")}
-                        # Get phone via Place Details
-                        det_url = "https://maps.googleapis.com/maps/api/place/details/json"
-                        det_params = {"place_id": p["place_id"],
-                                      "fields": "formatted_phone_number,formatted_address",
-                                      "key": GOOGLE_KEY}
-                        d = requests.get(det_url, params=det_params, timeout=15)
-                        if d.status_code == 200:
-                            details.update(d.json().get("result", {}))
-                        hits.append(details)
+                    # Storefront filter: drop pure address/premise + non-storefront places
+                    label = classify_place(types)
+                    if label is None:
+                        continue
+                    details = {"name": p.get("name"), "place_id": p.get("place_id"),
+                               "types": types, "rating": p.get("rating"),
+                               "vicinity": p.get("vicinity"),
+                               "confidence": label}
+                    # Get phone via Place Details
+                    det_url = "https://maps.googleapis.com/maps/api/place/details/json"
+                    det_params = {"place_id": p["place_id"],
+                                  "fields": "formatted_phone_number,formatted_address,website",
+                                  "key": GOOGLE_KEY}
+                    d = requests.get(det_url, params=det_params, timeout=15)
+                    if d.status_code == 200:
+                        details.update(d.json().get("result", {}))
+                    hits.append(details)
+                # Sort: Likely > Maybe > Unknown
+                order = {"Likely storefront": 0, "Maybe storefront": 1, "Unknown": 2}
+                hits.sort(key=lambda x: order.get(x.get("confidence"), 9))
                 results[num] = hits
         except Exception:
             pass
@@ -275,9 +332,14 @@ def build_final_table(permits: pd.DataFrame, geocoded: dict, osm: dict,
 
         # Google hits (highest priority)
         for h in google.get(num, []):
-            rows.append({**base, "Business": h["name"], "Phone": h.get("formatted_phone_number"),
+            rows.append({**base,
+                         "Business": h["name"],
+                         "Confidence": h.get("confidence", ""),
+                         "Phone": h.get("formatted_phone_number"),
+                         "Website": h.get("website"),
                          "Category": ", ".join(h.get("types", [])[:2]),
-                         "Rating": h.get("rating"), "Source": "Google Places"})
+                         "Rating": h.get("rating"),
+                         "Source": "Google Places"})
 
         # OSM exact-address matches
         exact_hits = []
@@ -292,80 +354,83 @@ def build_final_table(permits: pd.DataFrame, geocoded: dict, osm: dict,
                 nearby_hits.append(h)
 
         for h in exact_hits:
-            rows.append({**base, "Business": h["name"], "Phone": h.get("phone"),
-                         "Category": h.get("kind"), "Rating": None,
+            rows.append({**base,
+                         "Business": h["name"],
+                         "Confidence": "OSM exact",
+                         "Phone": h.get("phone"),
+                         "Website": h.get("website"),
+                         "Category": h.get("kind"),
+                         "Rating": None,
                          "Source": "OpenStreetMap (exact address)"})
 
         # Only include OSM nearby hits if we have nothing else for this address
         if not google.get(num) and not exact_hits:
             for h in nearby_hits:
                 label = f"{h['name']} [at {h['addr_num']}]" if h.get("addr_num") else f"{h['name']} [nearby]"
-                rows.append({**base, "Business": label, "Phone": h.get("phone"),
-                             "Category": h.get("kind"), "Rating": None,
+                rows.append({**base,
+                             "Business": label,
+                             "Confidence": "OSM nearby",
+                             "Phone": h.get("phone"),
+                             "Website": h.get("website"),
+                             "Category": h.get("kind"),
+                             "Rating": None,
                              "Source": "OpenStreetMap (nearby - verify)"})
 
         # If nothing at all, keep address row with permit info
         if not google.get(num) and not exact_hits and not nearby_hits:
-            rows.append({**base, "Business": None, "Phone": None,
-                         "Category": None, "Rating": None, "Source": None})
+            rows.append({**base,
+                         "Business": None,
+                         "Confidence": "",
+                         "Phone": None,
+                         "Website": None,
+                         "Category": None,
+                         "Rating": None,
+                         "Source": "No business data"})
 
-    df = pd.DataFrame(rows)
-    cols = ["Address #", "Street", "Business", "Category", "Phone", "Rating", "Source",
-            "Building Owner / LLC", "Owner Phone (on file)", "Most Recent Awning Permit",
-            "Has Sidewalk Cafe", "Latitude", "Longitude"]
-    return df[cols].sort_values(["Address #", "Source"], kind="stable")
+    return pd.DataFrame(rows)
 
 
 # -------------------- MAIN --------------------
 def main():
-    ap = argparse.ArgumentParser(description="Find businesses with awning permits on a NYC street.")
+    ap = argparse.ArgumentParser(description="NYC Awning Lead Finder")
     ap.add_argument("street", help='Street name, e.g. "BLEECKER STREET"')
     ap.add_argument("--borough", default="MANHATTAN",
                     choices=["MANHATTAN", "BROOKLYN", "QUEENS", "BRONX", "STATEN ISLAND"])
-    ap.add_argument("--output", default=None, help="Output file prefix (no extension)")
-    ap.add_argument("--skip-osm", action="store_true", help="Skip OSM Overpass step")
+    ap.add_argument("--output", default=None,
+                    help="Output prefix for .xlsx and .csv (default: <street>_leads)")
+    ap.add_argument("--skip-osm", action="store_true",
+                    help="Skip OpenStreetMap Overpass lookup")
     args = ap.parse_args()
 
-    street = args.street.upper().strip()
+    street = args.street.strip().upper()
     borough = args.borough.upper()
     out_prefix = args.output or f"{street.replace(' ', '_')}_{borough}_AWNING_LEADS"
 
-    # Step 1: permits
+    # Step 1
     permits = fetch_awning_permits(street, borough)
     if permits.empty:
         print("\nNo awning permits found. Exiting.")
-        return 1
+        return 0
 
-    # Sidewalk cafes
-    cafes = fetch_sidewalk_cafes(street)
+    sidewalk = fetch_sidewalk_cafes(street)
 
-    # Step 2: geocode
     addresses = [(int(r["house_num"]), street) for _, r in permits.iterrows()]
+
+    # Step 2
     geocoded = geocode_addresses(addresses, borough)
 
-    # Step 3: OSM
+    # Step 3
     osm = {} if args.skip_osm else fetch_osm_pois(geocoded)
 
-    # Step 4: Google (optional)
+    # Step 4
     google = fetch_google_places(geocoded)
 
-    # Assemble
-    final = build_final_table(permits, geocoded, osm, google, cafes)
-
-    # Stats
-    total_addrs = permits["house_num"].nunique()
-    found_addrs = final[final["Business"].notna()]["Address #"].nunique()
-    print(f"\n{'='*60}")
-    print(f"SUMMARY")
-    print(f"  Street:                          {street}, {borough}")
-    print(f"  Awning-permit addresses:         {total_addrs}")
-    print(f"  Addresses w/ business found:     {found_addrs} ({found_addrs/total_addrs*100:.0f}%)")
-    print(f"  Total business leads:            {final['Business'].notna().sum()}")
-    print(f"{'='*60}")
-
-    final.to_csv(f"{out_prefix}.csv", index=False)
+    # Build & save
+    final = build_final_table(permits, geocoded, osm, google, sidewalk)
+    print(f"\nWriting {out_prefix}.xlsx and {out_prefix}.csv...")
     final.to_excel(f"{out_prefix}.xlsx", index=False)
-    print(f"\nWrote: {out_prefix}.csv")
+    final.to_csv(f"{out_prefix}.csv", index=False)
+    print(f"Wrote: {out_prefix}.csv")
     print(f"Wrote: {out_prefix}.xlsx")
     return 0
 
