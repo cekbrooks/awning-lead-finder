@@ -117,22 +117,48 @@ def fetch_sidewalk_cafes(street_name: str) -> set:
 
 # -------------------- STEP 2: GEOCODE --------------------
 def geocode_addresses(addresses, borough: str) -> dict:
-    """Geocode each (number, street) via Nominatim. Returns dict[num] -> (lat, lon)."""
-    print(f"\n[2/4] Geocoding {len(addresses)} addresses via OpenStreetMap...")
+    """Geocode (number, street) via Google if GOOGLE_KEY is set, else Nominatim."""
     results = {}
+
+    if GOOGLE_KEY:
+        print(f"\n[2/4] Geocoding {len(addresses)} addresses via Google Geocoding API...")
+        for num, street in addresses:
+            addr = f"{num} {street}, {borough}, NY"
+            try:
+                r = requests.get(
+                    "https://maps.googleapis.com/maps/api/geocode/json",
+                    params={"address": addr, "key": GOOGLE_KEY},
+                    timeout=15,
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    if data.get("status") == "OK" and data.get("results"):
+                        loc = data["results"][0]["geometry"]["location"]
+                        results[num] = (loc["lat"], loc["lng"])
+                    elif data.get("status") not in ("OK", "ZERO_RESULTS"):
+                        print(f"   Google geocode error for {addr}: {data.get('status')} {data.get('error_message','')}")
+                else:
+                    print(f"   Google geocode HTTP {r.status_code} for {addr}")
+            except Exception as e:
+                print(f"   Google geocode exception for {addr}: {e}")
+        print(f"   Geocoded {len(results)}/{len(addresses)} via Google.")
+        return results
+
+    # Fallback: Nominatim
+    print(f"\n[2/4] Geocoding {len(addresses)} addresses via OpenStreetMap (no Google key)...")
     headers = {"User-Agent": USER_AGENT}
     for num, street in addresses:
         addr = f"{num} {street} {borough} NY"
         try:
             r = requests.get(NOMINATIM_BASE, headers=headers,
-                             params={"q": addr, "format": "json", "limit": 1}, timeout=30)
+                             params={"q": addr, "format": "json", "limit": 1}, timeout=15)
             if r.status_code == 200 and r.json():
                 d = r.json()[0]
                 results[num] = (float(d["lat"]), float(d["lon"]))
-        except Exception:
-            pass
-        time.sleep(1.1)  # Nominatim rate limit: 1 req/sec
-    print(f"   Geocoded {len(results)}/{len(addresses)}.")
+        except Exception as e:
+            print(f"   Nominatim error for {addr}: {e}")
+        time.sleep(1.1)
+    print(f"   Geocoded {len(results)}/{len(addresses)} via Nominatim.")
     return results
 
 
@@ -346,3 +372,4 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+Use Google Geocoding API when key is set
